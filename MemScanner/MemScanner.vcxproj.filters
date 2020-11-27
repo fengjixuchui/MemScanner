@@ -24,6 +24,15 @@
     <ClCompile Include="Utils.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="DriverScanner.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SectionScanner.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ProcessScanner.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Private.h">
@@ -35,7 +44,16 @@
     <ClInclude Include="Import.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-	<ClInclude Include="NativeStruct.h">
+    <ClInclude Include="NativeStruct.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DriverScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessScanner.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SectionScanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

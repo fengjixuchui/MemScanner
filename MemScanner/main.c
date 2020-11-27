@@ -1,13 +1,18 @@
-#include "NativeStruct.h"
+Ôªø#include "NativeStruct.h"
 #include "Private.h"
 #include "Import.h"
 #include "Utils.h"
+#include "DriverScanner.h"
+#include "SectionScanner.h"
 #include <ntimage.h>
 
 
 
+KEVENT           g_ScannerFinishEvent;
+
 // OS Dependant data
-DYNAMIC_DATA dynData;
+DYNAMIC_DATA     g_dynData        = { 0 };
+PDRIVER_OBJECT   g_DriverObject = NULL;
 
 CHAR* g_szAssignedRegionNames[] = {
     "AssignedRegionNonPagedPool",
@@ -41,15 +46,17 @@ NTSTATUS MmsInitMemoryLayoutForWin8_1ToWin10TH2(IN OUT PDYNAMIC_DATA pData);
 NTSTATUS MmsInitMemoryLayoutForWin10RS1AndLater(IN OUT PDYNAMIC_DATA pData);
 
 VOID     MmsTestAllocateMemory();
+VOID     MmsScannerThread(IN PVOID StartContext);
 //---------------------------------------------------------------------------------------------------------
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
-    NTSTATUS Status = STATUS_SUCCESS;
+    NTSTATUS Status       = STATUS_SUCCESS;
+    HANDLE   ThreadHandle = NULL;
 
     UNREFERENCED_PARAMETER(RegistryPath);
 
     InitializeDebuggerBlock();
-    Status = MmsInitDynamicData(&dynData);
+    Status = MmsInitDynamicData(&g_dynData);
     if (!NT_SUCCESS(Status))
     {
         return Status;
@@ -61,16 +68,54 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return Status;
     }
 
-    MmsTestAllocateMemory();
- 
+    g_DriverObject = DriverObject;
+
     DriverObject->DriverUnload = DriverUnload;
+    
+    MmsTestAllocateMemory();
+
+    KeInitializeEvent(&g_ScannerFinishEvent, NotificationEvent, FALSE);
+    PsCreateSystemThread(&ThreadHandle,
+        0,
+        NULL,
+        NtCurrentProcess(),
+        NULL,
+        MmsScannerThread,
+        NULL);
+
+    if (ThreadHandle)
+    {
+        ZwClose(ThreadHandle);
+    }
 
     return STATUS_SUCCESS;
+}
+//---------------------------------------------------------------------------------------------------------
+VOID MmsScannerThread(IN PVOID StartContext)
+{
+    LARGE_INTEGER liDelayTime = { 0 };
+
+    liDelayTime.QuadPart = -1000 * 10000;
+    KeDelayExecutionThread(KernelMode, FALSE, &liDelayTime);
+
+    ScanDriver();
+    ScanSection();
+
+    KeSetEvent(&g_ScannerFinishEvent, IO_NO_INCREMENT, FALSE);
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 //---------------------------------------------------------------------------------------------------------
 VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
+
+    DbgPrint("[%s] Unloading\n", __FUNCTION__);
+
+    KeWaitForSingleObject(&g_ScannerFinishEvent, Executive, KernelMode, FALSE, NULL);
+
+    DbgPrint("[%s] Unload Complete\n", __FUNCTION__);
+
     return;
 }
 //---------------------------------------------------------------------------------------------------------
@@ -173,7 +218,7 @@ NTSTATUS MmsGetBuildNO(OUT PULONG pBuildNo)
         ZwClose(hKey);
     }
     else
-        DbgPrint("MemScanner: %s: ZwOpenKey failed with status 0x%X\n", __FUNCTION__, status);
+        DbgPrint("[%s] ZwOpenKey failed with status 0x%X\n", __FUNCTION__, status);
 
     return status;
 }
@@ -207,7 +252,8 @@ NTSTATUS MmsInitDynamicData(IN OUT PDYNAMIC_DATA pData)
     status = MmsGetBuildNO(&pData->buildNo);
 
     DbgPrint(
-        "MemScanner: OS version %d.%d.%d.%d.%d - 0x%x\n",
+        "[%s] OS version %d.%d.%d.%d.%d - 0x%x\n",
+        __FUNCTION__,
         verInfo.dwMajorVersion,
         verInfo.dwMinorVersion,
         verInfo.dwBuildNumber,
@@ -300,31 +346,22 @@ NTSTATUS MmsInitDynamicData(IN OUT PDYNAMIC_DATA pData)
     {
         status = MmsInitMemoryLayoutForWin10RS1AndLater(pData);
 
-        DbgPrint(
-            "MemScanner: %s: g_KdBlock->KernBase: %p, GetKernelBase() = 0x%p \n",
-            __FUNCTION__, g_KdBlock.KernBase, GetKernelBase(NULL));
+        DbgPrint("[%s] g_KdBlock->KernBase: %p, GetKernelBase() = 0x%p\n", __FUNCTION__, g_KdBlock.KernBase, GetKernelBase(NULL));
 
         ULONGLONG mask = (1ll << (PHYSICAL_ADDRESS_BITS - 1)) - 1;
-        dynData.DYN_PTE_BASE = (PVOID)g_KdBlock.PteBase;
-        dynData.DYN_PDE_BASE = (PVOID)((g_KdBlock.PteBase & ~mask) | ((g_KdBlock.PteBase >> 9) & mask));
+        g_dynData.DYN_PTE_BASE = (PVOID)g_KdBlock.PteBase;
+        g_dynData.DYN_PDE_BASE = (PVOID)((g_KdBlock.PteBase & ~mask) | ((g_KdBlock.PteBase >> 9) & mask));
     }
 
-    DbgPrint("MemScanner: %s: MmPagedPoolStart: 0x%p, MmPagedPoolEnd = 0x%p \n",
-        __FUNCTION__, pData->MmPagedPoolStart, pData->MmPagedPoolEnd);
+    DbgPrint("[%s] MmPagedPoolStart: 0x%p, MmPagedPoolEnd = 0x%p \n",       __FUNCTION__, pData->MmPagedPoolStart, pData->MmPagedPoolEnd);
+    DbgPrint("[%s] MmNonpagedPoolStart: 0x%p, MmNonpagedPoolEnd = 0x%p \n", __FUNCTION__, pData->MmNonpagedPoolStart, pData->MmNonpagedPoolEnd);
+    DbgPrint("[%s] MmSystemPtesStart: 0x%p, MmSystemPtesEnd = 0x%p \n",     __FUNCTION__, pData->MmSystemPtesStart, pData->MmSystemPtesEnd);
+    DbgPrint("[%s] MmDriverImageStart: 0x%p, MmDriverImageEnd = 0x%p \n",   __FUNCTION__, pData->MmDriverImageStart, pData->MmDriverImageEnd);
+    DbgPrint("[%s] PDE_BASE: %p, PTE_BASE: %p\n",                           __FUNCTION__, pData->DYN_PDE_BASE, pData->DYN_PTE_BASE);
 
-    DbgPrint("MemScanner: %s: MmNonpagedPoolStart: 0x%p, MmNonpagedPoolEnd = 0x%p \n",
-        __FUNCTION__, pData->MmNonpagedPoolStart, pData->MmNonpagedPoolEnd);
-
-    DbgPrint("MemScanner: %s: MmSystemPtesStart: 0x%p, MmSystemPtesEnd = 0x%p \n",
-        __FUNCTION__, pData->MmSystemPtesStart, pData->MmSystemPtesEnd);
-
-    DbgPrint("MemScanner: %s: MmDriverImageStart: 0x%p, MmDriverImageEnd = 0x%p \n",
-        __FUNCTION__, pData->MmDriverImageStart, pData->MmDriverImageEnd);
-
-    DbgPrint("MemScanner: PDE_BASE: %p, PTE_BASE: %p\n", pData->DYN_PDE_BASE, pData->DYN_PTE_BASE);
     if ((ULONG_PTR)pData->DYN_PDE_BASE < MI_SYSTEM_RANGE_START || (ULONG_PTR)pData->DYN_PTE_BASE < MI_SYSTEM_RANGE_START)
     {
-        DbgPrint("MemScanner: Invalid PDE/PTE base, aborting\n");
+        DbgPrint("[%s] Invalid PDE/PTE base, aborting\n", __FUNCTION__);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -339,19 +376,14 @@ NTSTATUS MmsInitMemoryLayoutForWin7AndWin8(IN OUT PDYNAMIC_DATA pData)
         return STATUS_INVALID_ADDRESS;
     }
 
-    if (!g_KdDebuggerDataBlock)
-    {
-        return STATUS_DLL_INIT_FAILED;
-    }
-
-    if (!g_KdDebuggerDataBlock->MmNonPagedPoolStart || !g_KdDebuggerDataBlock->MmMaximumNonPagedPoolInBytes)
+    if (!g_KdBlock.MmNonPagedPoolStart || !g_KdBlock.MmMaximumNonPagedPoolInBytes)
     {
         return STATUS_UNSUCCESSFUL;
     }
 
-    // ø…¿©’π«¯”Ú
-    pData->MmNonpagedPoolStart = *(PVOID*)g_KdDebuggerDataBlock->MmNonPagedPoolStart;
-    pData->MmNonpagedPoolEnd   = (PVOID)((PUCHAR)pData->MmNonpagedPoolStart + *(PULONG_PTR)g_KdDebuggerDataBlock->MmMaximumNonPagedPoolInBytes - 1);
+    // ÂèØÊâ©Â±ïÂå∫Âüü
+    pData->MmNonpagedPoolStart = *(PVOID*)g_KdBlock.MmNonPagedPoolStart;
+    pData->MmNonpagedPoolEnd   = (PVOID)((PUCHAR)pData->MmNonpagedPoolStart + *(PULONG_PTR)g_KdBlock.MmMaximumNonPagedPoolInBytes - 1);
 
     pData->MmPteSpaceStart   = (PVOID)0xFFFFF68000000000;
     pData->MmPteSpacecEnd    = (PVOID)0xFFFFF6FFFFFFFFFF;
@@ -415,7 +447,7 @@ NTSTATUS MmsInitMemoryLayoutForWin8_1ToWin10TH2(IN OUT PDYNAMIC_DATA pData)
     pData->MmSystemPtesEnd   = (PVOID)0xFFFFDFFFFFFFFFFF;
 
     pData->MmNonpagedPoolStart = (PVOID)0xFFFFE00000000000;
-    pData->MmNonpagedPoolEnd   = (PVOID)0xFFFFF00000000000;//µ»∑÷≥…KeNumberNodesøÈ
+    pData->MmNonpagedPoolEnd   = (PVOID)0xFFFFF00000000000;//Á≠âÂàÜÊàêKeNumberNodesÂùó
 
     pData->MmDriverImageStart = (PVOID)0xFFFFF80000000000;
     pData->MmDriverImageEnd   = (PVOID)0xFFFFF87FFFFFFFFF;
@@ -451,14 +483,14 @@ NTSTATUS MmsInitMemoryLayoutForWin10RS1AndLater(IN OUT PDYNAMIC_DATA pData)
 
     if (!lpTargetAddr)
     {
-        DbgPrint("MemScanner: %s: MmsScanSection Failed\n", __FUNCTION__);
+        DbgPrint("[%s] MmsScanSection Failed\n", __FUNCTION__);
         return STATUS_NOT_FOUND;
     }
 
     lpMiSystemVaAssignment = (PMI_SYSTEM_VA_ASSIGNMENT)((PUCHAR)lpTargetAddr + *(PULONG)((PUCHAR)lpTargetAddr + 6) + 10);
     for (ulIndex = 0; ulIndex < AssignedRegionMaximum; ulIndex++)
     {
-        DbgPrint("MemScanner: %s: Names:%s, BaseAddr:%I64x, Size:%I64x\n", 
+        DbgPrint("[%s] Names:%s, BaseAddr:%I64x, Size:%I64x\n", 
             __FUNCTION__, 
             g_szAssignedRegionNames[ulIndex],
             lpMiSystemVaAssignment[ulIndex].BaseAddress, 
@@ -487,36 +519,48 @@ NTSTATUS MmsInitMemoryLayoutForWin10RS1AndLater(IN OUT PDYNAMIC_DATA pData)
     pData->MmSystemPtesEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[AssignedRegionSystemPtes].BaseAddress + lpMiSystemVaAssignment[AssignedRegionSystemPtes].NumberOfBytes - 1);
 
     pData->MmNonpagedPoolStart = (PVOID)lpMiSystemVaAssignment[AssignedRegionNonPagedPool].BaseAddress;
-    pData->MmNonpagedPoolEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[AssignedRegionNonPagedPool].BaseAddress + lpMiSystemVaAssignment[AssignedRegionNonPagedPool].NumberOfBytes - 1);//µ»∑÷≥…KeNumberNodesøÈ
+    pData->MmNonpagedPoolEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[AssignedRegionNonPagedPool].BaseAddress + lpMiSystemVaAssignment[AssignedRegionNonPagedPool].NumberOfBytes - 1);//Á≠âÂàÜÊàêKeNumberNodesÂùó
 
     if (pData->ver == WINVER_10_RS1)
     {
         pData->MmDriverImageStart = (PVOID)lpMiSystemVaAssignment[13].BaseAddress;
-        pData->MmDriverImageEnd = (PVOID)((PUCHAR)lpMiSystemVaAssignment[13].BaseAddress + lpMiSystemVaAssignment[13].NumberOfBytes - 1);
+        pData->MmDriverImageEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[13].BaseAddress + lpMiSystemVaAssignment[13].NumberOfBytes - 1);
+
+        pData->MmSessionSpaceStart = (PVOID)lpMiSystemVaAssignment[10].BaseAddress;
+        pData->MmSessionSpaceEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[10].BaseAddress + lpMiSystemVaAssignment[10].NumberOfBytes - 1);
     }
     else if (pData->ver == WINVER_10_RS2)
     {
         pData->MmDriverImageStart = (PVOID)lpMiSystemVaAssignment[12].BaseAddress;
-        pData->MmDriverImageEnd = (PVOID)((PUCHAR)lpMiSystemVaAssignment[12].BaseAddress + lpMiSystemVaAssignment[12].NumberOfBytes - 1);
+        pData->MmDriverImageEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[12].BaseAddress + lpMiSystemVaAssignment[12].NumberOfBytes - 1);
+
+        pData->MmSessionSpaceStart = (PVOID)lpMiSystemVaAssignment[11].BaseAddress;
+        pData->MmSessionSpaceEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[11].BaseAddress + lpMiSystemVaAssignment[11].NumberOfBytes - 1);
     }
-    if (pData->ver >= WINVER_10_RS3 && pData->ver <= WINVER_10_RS5)
+    else if (pData->ver >= WINVER_10_RS3 && pData->ver <= WINVER_10_RS5)
     {
         pData->MmDriverImageStart = (PVOID)lpMiSystemVaAssignment[13].BaseAddress;
-        pData->MmDriverImageEnd = (PVOID)((PUCHAR)lpMiSystemVaAssignment[13].BaseAddress + lpMiSystemVaAssignment[13].NumberOfBytes - 1);
+        pData->MmDriverImageEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[13].BaseAddress + lpMiSystemVaAssignment[13].NumberOfBytes - 1);
+
+        pData->MmSessionSpaceStart = (PVOID)lpMiSystemVaAssignment[12].BaseAddress;
+        pData->MmSessionSpaceEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[12].BaseAddress + lpMiSystemVaAssignment[12].NumberOfBytes - 1);
     }
-    if (pData->ver == WINVER_10_19H1 || pData->ver == WINVER_10_19H2)
+    else if (pData->ver == WINVER_10_19H1 || pData->ver == WINVER_10_19H2)
     {
         pData->MmDriverImageStart = (PVOID)lpMiSystemVaAssignment[11].BaseAddress;
-        pData->MmDriverImageEnd = (PVOID)((PUCHAR)lpMiSystemVaAssignment[11].BaseAddress + lpMiSystemVaAssignment[11].NumberOfBytes - 1);
+        pData->MmDriverImageEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[11].BaseAddress + lpMiSystemVaAssignment[11].NumberOfBytes - 1);
+
+        pData->MmSessionSpaceStart = (PVOID)lpMiSystemVaAssignment[10].BaseAddress;
+        pData->MmSessionSpaceEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[10].BaseAddress + lpMiSystemVaAssignment[10].NumberOfBytes - 1);
     }
     else if (pData->ver >= WINVER_10_20H1)
     {
         pData->MmDriverImageStart = (PVOID)lpMiSystemVaAssignment[AssignedRegionSystemImages].BaseAddress;
-        pData->MmDriverImageEnd = (PVOID)((PUCHAR)lpMiSystemVaAssignment[AssignedRegionSystemImages].BaseAddress + lpMiSystemVaAssignment[AssignedRegionSystemImages].NumberOfBytes - 1);
-    }
+        pData->MmDriverImageEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[AssignedRegionSystemImages].BaseAddress + lpMiSystemVaAssignment[AssignedRegionSystemImages].NumberOfBytes - 1);
 
-    //pData->MmSessionSpaceStart = (PVOID)lpMiSystemVaAssignment[AssignedRegionSession].BaseAddress;
-    //pData->MmSessionSpaceEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[AssignedRegionSession].BaseAddress + lpMiSystemVaAssignment[AssignedRegionSession].NumberOfBytes - 1);
+        pData->MmSessionSpaceStart = (PVOID)lpMiSystemVaAssignment[10].BaseAddress;
+        pData->MmSessionSpaceEnd   = (PVOID)((PUCHAR)lpMiSystemVaAssignment[10].BaseAddress + lpMiSystemVaAssignment[10].NumberOfBytes - 1);
+    }
 
     pData->MmDynamicVASpaceStart = (PVOID)NULL;
     pData->MmDynamicVASpaceEnd   = (PVOID)NULL;
@@ -534,7 +578,7 @@ VOID MmsTestAllocatePagedPoolMemory()
     lpAddr = ExAllocatePoolWithTag(PagedPool, 256, MMS_POOL_TAG);
     if (lpAddr)
     {
-        DbgPrint("MemScanner: %s: AllocateAddress:%p\n", __FUNCTION__, lpAddr);
+        DbgPrint("[%s] AllocateAddress:%p\n", __FUNCTION__, lpAddr);
         ExFreePool(lpAddr);
     }
 }
@@ -546,7 +590,7 @@ VOID MmsTestAllocateNonPagedPoolMemory()
     lpAddr = ExAllocatePoolWithTag(NonPagedPool, 256, MMS_POOL_TAG);
     if (lpAddr)
     {
-        DbgPrint("MemScanner: %s: AllocateAddress:%p\n", __FUNCTION__, lpAddr);
+        DbgPrint("[%s] AllocateAddress:%p\n", __FUNCTION__, lpAddr);
         ExFreePool(lpAddr);
     }
 }
@@ -566,7 +610,7 @@ VOID MmsTestAllocateMDLMemory()
         PVOID lpMappedAddr = MmMapLockedPagesSpecifyCache(pMdl, KernelMode, MmNonCached, NULL, 0, 0);
         if (lpMappedAddr)
         {
-            DbgPrint("MemScanner: %s: AllocateAddress:%p\n", __FUNCTION__, lpMappedAddr);
+            DbgPrint("[%s] AllocateAddress:%p\n", __FUNCTION__, lpMappedAddr);
 
             MmUnmapLockedPages(lpMappedAddr, pMdl);
             lpMappedAddr;
@@ -630,7 +674,7 @@ VOID MmsTestMapViewInSystemSpace()
     }
 
     MmMapViewInSystemSpace(SectionObject, &MappedAddr, &MappedSize);
-    DbgPrint("MemScanner: %s: MappedAddr:%p MappedSize:%x\n", __FUNCTION__, MappedAddr, MappedSize);
+    DbgPrint("[%s] MappedAddr:%p MappedSize:%x\n", __FUNCTION__, MappedAddr, MappedSize);
 
 Cleanup:
 
@@ -667,11 +711,11 @@ VOID MmsTestAllocateContiguousMemory()
     PHYSICAL_ADDRESS HighestAcceptAddress = {0};
     HighestAcceptAddress.QuadPart = 1000000000;
 
-    // …Í«Î¡¨–¯µƒ≤ªø…∑÷“≥ŒÔ¿Ìƒ⁄¥Êø’º‰ ≤¢”≥…‰µΩœµÕ≥ø’º‰
+    // Áî≥ËØ∑ËøûÁª≠ÁöÑ‰∏çÂèØÂàÜÈ°µÁâ©ÁêÜÂÜÖÂ≠òÁ©∫Èó¥ Âπ∂Êò†Â∞ÑÂà∞Á≥ªÁªüÁ©∫Èó¥
     lpVirtualAddr = MmAllocateContiguousMemory(PAGE_SIZE * 10, HighestAcceptAddress);
     if (lpVirtualAddr)
     {
-        DbgPrint("MemScanner: %s: lpVirtualAddr:%p\n", __FUNCTION__, lpVirtualAddr);
+        DbgPrint("[%s] lpVirtualAddr:%p\n", __FUNCTION__, lpVirtualAddr);
         MmFreeContiguousMemory(lpVirtualAddr);
     }
 }
